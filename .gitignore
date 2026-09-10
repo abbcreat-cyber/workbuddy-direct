@@ -1,0 +1,16 @@
+# secrets
+wb-api-key.txt
+.env
+.env.*
+*.key
+
+# runtime
+logs/
+*.log
+
+# deps / misc
+node_modules/
+shot-view.png
+probe-3089.*
+.DS_Store
+Thumbs.db
