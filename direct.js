@@ -46,6 +46,10 @@ const LOCAL_KEY = process.env.WB_DIRECT_KEY || '';
 // 曾设 600s，结果上游抖动时表现为「客户端连续重试 → 502」。
 // 120s 足够覆盖大上下文，且能快速失败、快速恢复。
 const TIMEOUT_MS = Number(process.env.WB_TIMEOUT_MS || 120000);
+// 请求体上限。★ 必须与上游转发器（如 Codex 的 router）的 readBody 上限保持一致，
+// 否则会出现「下游收得下、这里先掐断」或反之的不一致区间，
+// 而掐断（req.destroy）产生的错误码正是 ECONNRESET，极难排查。
+const MAX_BODY = Number(process.env.WB_MAX_BODY || 512 * 1024 * 1024);
 // ---------------------------------------------------------------- API Key 查找
 // 按顺序尝试，先命中先用：
 //   1. 环境变量 CODEBUDDY_API_KEY
@@ -776,18 +780,49 @@ const server = http.createServer((req, res) => {
     return json(res, 404, { error: { message: `not found: ${p}`, type: 'invalid_request_error' } });
   }
 
-  let raw = '';
+  // ★ 用 Buffer 数组累积，而不是字符串 `raw += c`：
+  //   后者对大请求体会产生 O(n²) 拷贝，且 JS 字符串是 UTF-16、约占 2 倍内存。
+  //   在上限提到 512MB 后，这个差别是致命的（字符串方案会吃掉 1GB+ 内存）。
+  //   上限值见文件顶部 MAX_BODY（可用 WB_MAX_BODY 调整）。
+  const chunks = [];
+  let total = 0;
+  // 诊断：记录连接异常，定位「只收到请求头、body 传不完」的原因
+  const _diag = (m) => {
+    if (process.env.WB_DUMP_REQ) log(`  [req] ${m}`);
+  };
+  req.on('aborted', () => _diag(`aborted by peer  已收 ${total} 字节  path=${p}`));
+  req.on('error', (e) => _diag(`error ${e && (e.code || e.message)}  已收 ${total} 字节  path=${p}`));
+  req.on('close', () => {
+    if (!req.complete) _diag(`closed BEFORE complete  已收 ${total} 字节 / 期望 ${req.headers['content-length'] || '?'}  path=${p}`);
+  });
   req.on('data', (c) => {
-    raw += c;
-    if (raw.length > 32 * 1024 * 1024) req.destroy();
+    total += c.length;
+    if (total > MAX_BODY) {
+      _diag(`body 超过上限 ${MAX_BODY}，主动断开`);
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
   });
   req.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
     let body;
     try {
       body = JSON.parse(raw || '{}');
     } catch (e) {
       return json(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request_error' } });
     }
+    // 调试用：设了 WB_DUMP_REQ=<目录> 就把每个请求体落盘，便于排查"某个特定请求卡住"
+    if (process.env.WB_DUMP_REQ) {
+      try {
+        const f = path.join(process.env.WB_DUMP_REQ, `req-${Date.now()}-${isResp ? 'resp' : 'chat'}.json`);
+        fs.writeFileSync(f, JSON.stringify(body, null, 1));
+        log(`  [dump] ${path.basename(f)}  (${raw.length} 字节)`);
+      } catch (e) {
+        /* 落盘失败不影响主流程 */
+      }
+    }
+
     const fn = isChat ? handleChat : handleResponses;
     fn(req, res, body).catch((e) => {
       log(`❌ 未捕获异常: ${e.message}`);

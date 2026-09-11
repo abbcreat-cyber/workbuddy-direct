@@ -316,6 +316,53 @@ CLI 本身是个 agent，**内置完整的自动压缩流水线**。你把 CLI �
 dsh --profile <name> --dump-config | grep -A 4 compaction-basic
 ```
 
+#### 6. 接 Codex 时：本机转发器把「本地请求」也送进了系统代理
+
+**症状**：Codex 一律报
+
+```
+502 Bad Gateway: 本机模型转发失败：ECONNRESET
+```
+
+而 wb-direct 侧**只收到请求头**（日志里只有 `← POST /responses`），**请求体从未接收完整**。
+
+**根因**：介于 Codex 与本代理之间的本机转发器，**把发往 `127.0.0.1:3090` 的请求也交给了系统代理**：
+
+```js
+const env = process.env.HTTPS_PROXY || process.env.https_proxy || ...;
+if (env) return env;                            // ← 命中系统代理
+dispatcherState = { proxy, dispatcher: proxy ? new ProxyAgent(proxy) : new Agent() };
+//                    ↑ 所有请求都走代理 —— 包括回环地址
+```
+
+链路于是变成 `Codex → 转发器 → 系统代理 → wb-direct`，
+**系统代理在转发回环地址时失败，返回 502**。
+
+> **★ 判据**：`502 Bad Gateway` 是**代理 / 网关语义**的错误码。
+> 本代理**不会产生 502**（它只返回 200 / 4xx / JSON 错误）。
+> **看到 502，第一个要问的就是「这一跳中间有没有代理」。**
+
+**修法**：本地回环地址直连，绕开代理：
+
+```js
+const isLoopback = (u) => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(String(u || ''));
+dispatcher: isLoopback(target) ? getDirectDispatcher() : getDispatcher(),
+```
+
+#### 7. 两端的请求体上限必须对齐
+
+```
+转发器     上限 128 MB
+wb-direct  上限  32 MB     ← 比转发器还严，中间那段区间的请求会在这里被掐断
+```
+
+被掐断时执行的是 `req.destroy()`，**产生的错误码恰好也是 `ECONNRESET`**。
+
+**修法**：
+1. 两端**对齐到同一个值**（本代理已统一为 512MB，可用 `WB_MAX_BODY` 调整）；
+2. 内部累积请求体要用 **Buffer 数组**，**不要用字符串 `raw += chunk`** ——
+   后者对大请求体会产生 O(n²) 拷贝，且 JS 字符串是 UTF-16、约占 2 倍内存。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -653,6 +700,53 @@ Verify it actually took effect:
 ```bash
 dsh --profile <name> --dump-config | grep -A 4 compaction-basic
 ```
+
+#### 6. When wiring up Codex: the local forwarder routes loopback requests through the system proxy
+
+**Symptom**: Codex always reports
+
+```
+502 Bad Gateway: 本机模型转发失败：ECONNRESET
+```
+
+while on the wb-direct side you **only ever see the request headers** (just `← POST /responses` in the log) — **the request body never arrives in full**.
+
+**Root cause**: the local forwarder sitting between Codex and this proxy **also sends requests destined for `127.0.0.1:3090` through the system proxy**:
+
+```js
+const env = process.env.HTTPS_PROXY || process.env.https_proxy || ...;
+if (env) return env;                            // ← picks up the system proxy
+dispatcherState = { proxy, dispatcher: proxy ? new ProxyAgent(proxy) : new Agent() };
+//                    ↑ every request goes through it — loopback included
+```
+
+The chain becomes `Codex → forwarder → system proxy → wb-direct`,
+and **the proxy fails when forwarding a loopback address, returning 502**.
+
+> **★ Key tell**: `502 Bad Gateway` is a **proxy / gateway**-semantic error code.
+> This proxy **never produces a 502** (it returns 200 / 4xx / JSON errors only).
+> **When you see a 502, the first question to ask is "is there a proxy in this hop?"**
+
+**Fix**: bypass the proxy for loopback targets:
+
+```js
+const isLoopback = (u) => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(String(u || ''));
+dispatcher: isLoopback(target) ? getDirectDispatcher() : getDispatcher(),
+```
+
+#### 7. Body-size limits must match on both ends
+
+```
+forwarder   limit 128 MB
+wb-direct   limit  32 MB     ← stricter than the forwarder; anything in between gets cut here
+```
+
+Cutting a request off executes `req.destroy()`, whose **error code is exactly `ECONNRESET`**.
+
+**Fix**:
+1. **Align both ends to the same value** (this proxy now uses 512MB, tunable via `WB_MAX_BODY`);
+2. Accumulate the body into a **Buffer array** — **never `raw += chunk`**.
+   The string form costs O(n²) copying on large bodies, and JS strings are UTF-16 (~2× memory).
 
 ### Environment variables
 
