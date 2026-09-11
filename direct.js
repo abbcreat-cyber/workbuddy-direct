@@ -41,7 +41,11 @@ const HOST = process.env.WB_DIRECT_HOST || '127.0.0.1';
 const MIN_INTERVAL_MS = Number(process.env.WB_MIN_INTERVAL_MS || 1200);
 const MAX_RETRIES = Number(process.env.WB_MAX_RETRIES || 3);
 const LOCAL_KEY = process.env.WB_DIRECT_KEY || '';
-const TIMEOUT_MS = Number(process.env.WB_TIMEOUT_MS || 600000);
+// 上游单次请求超时。
+// ★ 别调大：本代理是串行队列（反风控），一个请求死等会把后面的全部堵住。
+// 曾设 600s，结果上游抖动时表现为「客户端连续重试 → 502」。
+// 120s 足够覆盖大上下文，且能快速失败、快速恢复。
+const TIMEOUT_MS = Number(process.env.WB_TIMEOUT_MS || 120000);
 // ---------------------------------------------------------------- API Key 查找
 // 按顺序尝试，先命中先用：
 //   1. 环境变量 CODEBUDDY_API_KEY
