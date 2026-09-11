@@ -164,18 +164,45 @@ if (!AUTH) {
 
 // ---------------------------------------------------------------- 限速 + 串行
 
-let _chain = Promise.resolve();
+// ---------------------------------------------------------------- 并发 + 限速
+// 设计取舍：
+//   - 原实现是「全局串行」（一次只飞一个请求）：并发 7 时后 6 个必须等前一个
+//     完成，总耗时随并发数线性增长，明显慢于旧的「多实例并行」方案。
+//   - 但上游并不要求串行：旧的桥接方案就是 7 个进程真并行打同一个后端，实测可用。
+//   - 所以这里改成【并发池 + 发出间隔】：
+//       最多 CONCURRENCY 个请求同时在飞；
+//       同时保证两次「发出」之间至少间隔 MIN_INTERVAL_MS（防突发，仍保留反风控意义）。
+//   - WB_CONCURRENCY=1 可退回完全串行；想更放开就调大。
+const CONCURRENCY = Math.max(1, Number(process.env.WB_CONCURRENCY || 4));
+
+let _inflight = 0;
+const _waiters = [];
 let _lastStart = 0;
 
-function schedule(fn) {
-  const run = _chain.then(async () => {
+function acquire() {
+  if (_inflight < CONCURRENCY) {
+    _inflight += 1;
+    return Promise.resolve();
+  }
+  return new Promise((r) => _waiters.push(r));
+}
+
+function release() {
+  const next = _waiters.shift();
+  if (next) next(); // 名额直接转交，_inflight 保持不变
+  else _inflight -= 1;
+}
+
+async function schedule(fn) {
+  await acquire();
+  try {
     const wait = _lastStart + MIN_INTERVAL_MS + jitter() - Date.now();
     if (wait > 0) await sleep(wait);
     _lastStart = Date.now();
-    return fn();
-  });
-  _chain = run.then(() => undefined, () => undefined);
-  return run;
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 function upstreamHeaders() {
@@ -776,7 +803,7 @@ server.listen(PORT, HOST, () => {
   log(`wb-direct v2 已启动  http://${HOST}:${PORT}`);
   log(`上游: ${UPSTREAM}`);
   log(`凭据: ${AUTH.source}  (${AUTH.token.length} 字符)` + (AUTH.uid ? `  uid=${AUTH.uid.slice(0, 8)}…` : ''));
-  log(`模型: ${MODELS.length} 个 | 限速: ${MIN_INTERVAL_MS}ms + 抖动 | 重试: ${MAX_RETRIES}`);
+  log(`模型: ${MODELS.length} 个 | 并发: ${CONCURRENCY} | 发出间隔: ${MIN_INTERVAL_MS}ms + 抖动 | 重试: ${MAX_RETRIES}`);
   log(`端点: /v1/chat/completions  /v1/responses  /v1/models  /health`);
   log(`本地鉴权: ${LOCAL_KEY ? '开启' : '关闭（仅监听 127.0.0.1）'}`);
 });
